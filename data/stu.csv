@@ -1,0 +1,6 @@
+ID,Name,Age,Gender,Grade
+1001,Alice,20,Female,A
+1002,Bob,21,Male,B
+1003,Charlie,19,Male,A
+--, Na, 1000000, Female, D
+1004,Diana,22,Female,C
