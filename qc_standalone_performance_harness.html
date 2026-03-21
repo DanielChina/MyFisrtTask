@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QC Standalone Performance Harness</title>
+
+  <!-- CSS CDN -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css" />
+  <link rel="stylesheet" href="https://code.jquery.com/ui/1.13.2/themes/base/jquery-ui.css" />
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css" />
+  <link rel="stylesheet" href="https://cdn.datatables.net/select/1.7.0/css/select.dataTables.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-datepicker/1.9.0/css/bootstrap-datepicker.min.css" />
+
+  <style>
+    body { background:#f6f8fb; font-family:Arial, sans-serif; }
+    .page-shell { max-width: 1600px; margin: 0 auto; padding: 18px; }
+    .top-panel, .card-lite, .perf-box { background:#fff; border:1px solid #dde3ea; border-radius:8px; }
+    .top-panel { padding:16px; margin-bottom:16px; }
+    .perf-box { padding:10px 14px; margin-bottom:12px; }
+    .card-lite { padding:14px; }
+    #report_stage_list .card { margin-bottom:10px; box-shadow:0 1px 4px rgba(0,0,0,.06); }
+    #report_stage_list .card-header { background:#fff; cursor:pointer; padding:0; }
+    #report_stage_list .card-header .btn { text-align:left; width:100%; padding:12px 16px; }
+    #report_stage_list .card.active .card-header,
+    #report_stage_list .card.bg-secondary .card-header { background:#6c757d; color:#fff; }
+    #chart { min-height:420px; border:1px solid #e0e0e0; background:#fff; }
+    #control_bars > div { margin-top:8px; }
+    #chart_labels, #rating_table, #metadata_body { background:#fff; }
+    #chart_series_toggles { min-width:140px; }
+    .placeholder-box { padding:20px; min-height:120px; border:1px dashed #c9d1db; background:#fafbfd; }
+    .stats-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); gap:10px; }
+    .stats-cell { border:1px solid #e4e7eb; border-radius:6px; padding:10px; background:#fff; }
+    .small-muted { color:#6c757d; font-size:12px; }
+    .loading-mask {
+      position:fixed; inset:0; display:none; z-index:9999;
+      align-items:center; justify-content:center;
+      background:rgba(255,255,255,.6); font-weight:bold; font-size:22px;
+    }
+    #dygraph_host { width:100%; height:420px; }
+    .control-bar-host { width:100%; height:90px; }
+    textarea.code-view { width:100%; min-height:180px; font-family:monospace; font-size:12px; }
+  </style>
+
+  <script>
+    'use strict';
+
+    // =====================================================================================
+    // Synthetic data generator - self-contained replacement for request payload
+    // Generates 1 point / minute for 1 year, with datetime as string and value with 3 decimals
+    // =====================================================================================
+    const SyntheticDataFactory = (function () {
+      function pad(n) { return String(n).padStart(2, '0'); }
+
+      function formatMinuteString(d) {
+        return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+      }
+
+      function mulberry32(seed) {
+        return function() {
+          let t = seed += 0x6D2B79F5;
+          t = Math.imul(t ^ (t >>> 15), t | 1);
+          t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      function makeSeries(config) {
+        const options = Object.assign({
+          start: '2025-01-01T00:00:00',
+          minutes: 365 * 24 * 60,
+          base: 15,
+          dailyAmp: 8,
+          weeklyAmp: 3,
+          annualAmp: 2,
+          noiseAmp: 0.35,
+          seed: 42,
+          qcCode: 10,
+          label: 'Cmd.P'
+        }, config || {});
+
+        const rand = mulberry32(options.seed);
+        const startDate = new Date(options.start);
+        const annualData = new Array(options.minutes);
+
+        for (let i = 0; i < options.minutes; i++) {
+          const d = new Date(startDate.getTime() + i * 60000);
+          const daily = options.dailyAmp * Math.sin((2 * Math.PI * (i % 1440)) / 1440);
+          const weekly = options.weeklyAmp * Math.sin((2 * Math.PI * (i % 10080)) / 10080);
+          const annual = options.annualAmp * Math.sin((2 * Math.PI * i) / options.minutes);
+          const noise = (rand() * 2 - 1) * options.noiseAmp;
+          const value = +(options.base + daily + weekly + annual + noise).toFixed(3);
+
+          annualData[i] = [
+            d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':00',
+            value,
+            0,
+            options.qcCode
+          ];
+        }
+
+        return {
+          label: options.label,
+          annual_data: annualData,
+          period_data: null
+        };
+      }
+
+      function makeRemarks(start, count) {
+        const base = new Date(start);
+        const arr = [];
+        for (let i = 0; i < count; i++) {
+          const d = new Date(base.getTime() + i * 28 * 24 * 60 * 60000);
+          arr.push({
+            validFrom: d.toISOString(),
+            source: 'Cmd.P',
+            remarkText: 'Synthetic remark #' + (i + 1)
+          });
+        }
+        return { annual_data: arr, period_data: null };
+      }
+
+      function makeLevelBundle() {
+        const cmdP = makeSeries({ label: 'Cmd.P', qcCode: 10, seed: 42, base: 15 });
+        const cmdO = makeSeries({ label: 'Cmd.O', qcCode: 10, seed: 77, base: 14.8, noiseAmp: 0.22, dailyAmp: 7.6, weeklyAmp: 2.8 });
+        const obsEpb = makeSeries({ label: 'Obs.EPB', qcCode: 10, seed: 11, base: 15.1, dailyAmp: 0.3, weeklyAmp: 0.1, annualAmp: 0.05, noiseAmp: 0.03 });
+        const obsEsg = makeSeries({ label: 'Obs.ESG', qcCode: 10, seed: 12, base: 15.2, dailyAmp: 0.25, weeklyAmp: 0.09, annualAmp: 0.04, noiseAmp: 0.02 });
+        const obsLaser = makeSeries({ label: 'Obs.Laser', qcCode: 10, seed: 13, base: 15.15, dailyAmp: 0.22, weeklyAmp: 0.08, annualAmp: 0.04, noiseAmp: 0.02 });
+
+        return {
+          version: '4.0',
+          report_metadata: {
+            report_type: 'Level',
+            period_from_date: '2025-10-01',
+            period_to_date: '2025-12-31',
+            report_stage_list: {
+              annual_consistent_qc_trace: true,
+              period_observer_readings_okay: true,
+              period_observer_readings_correctness: true,
+              period_p_vs_o: true,
+              period_qc_bar: true,
+              river_response: true,
+              hydrograph_shape: true,
+              hydrograph_magnitudes: true,
+              hydrograph_regression: true,
+              adequate_comments: true,
+              obs_vs_logger_okay: true
+            }
+          },
+          audit_site: {
+            site_id: '1001',
+            station_id: 'A',
+            site_name: 'Synthetic Audit Site',
+            station_name: 'Logger',
+            level: {
+              cmd_o: cmdO,
+              cmd_p: cmdP,
+              obs_epb: obsEpb,
+              obs_esg: obsEsg,
+              obs_laser: obsLaser
+            },
+            remarks: makeRemarks('2025-01-15T00:00:00', 12)
+          },
+          level_site: {
+            site_id: '2001',
+            station_id: 'B',
+            site_name: 'Comparison Site',
+            station_name: 'Logger',
+            level: {
+              cmd_p: makeSeries({ label: 'Comparison Cmd.P', qcCode: 10, seed: 99, base: 16.5, dailyAmp: 6.5, weeklyAmp: 2.2, annualAmp: 1.3 })
+            }
+          },
+          precip_site: {
+            site_id: '3001',
+            station_id: 'C',
+            site_name: 'Synthetic Rain Site',
+            station_name: 'Rain',
+            precip: {
+              cmd_p: makeSeries({ label: 'Rain Cmd.P', qcCode: 10, seed: 20, base: 3.0, dailyAmp: 1.8, weeklyAmp: 1.2, annualAmp: 0.8 })
+            }
+          },
+          annotation_data: [
+            { ACTION_REQUIRED: true, OPERATOR_ACTIONED: false, ANNOTATION_INDEX: 1 },
+            { ACTION_REQUIRED: false, OPERATOR_ACTIONED: false, ANNOTATION_INDEX: 2 }
+          ]
+        };
+      }
+
+      function exportSimpleJSON(ts) {
+        return ts.annual_data.map(row => ({
+          datetime: row[0].substring(0, 16).replace('T', ' '),
+          value: +Number(row[1]).toFixed(3)
+        }));
+      }
+
+      function exportCSV(ts) {
+        let out = 'datetime,value\n';
+        for (let i = 0; i < ts.annual_data.length; i++) {
+          const row = ts.annual_data[i];
+          out += row[0].substring(0, 16).replace('T', ' ') + ',' + Number(row[1]).toFixed(3) + '\n';
+        }
+        return out;
+      }
+
+      return {
+        makeLevelBundle,
+        exportSimpleJSON,
+        exportCSV,
+        formatMinuteString
+      };
+    })();
+  </script>
+</head>
+<body>
+<div class="loading-mask" id="loadingMask">Loading...</div>
+
+<div class="page-shell">
+  <div class="top-panel">
+    <div class="d-flex flex-wrap justify-content-between align-items-center">
+      <div>
+        <h3 class="mb-1">QC Standalone Performance Harness</h3>
+        <div class="small-muted">
+          Self-contained HTML, no Requests, synthetic 1-minute data for 1 year generated in-browser.
+        </div>
+      </div>
+      <div class="mt-2 mt-md-0">
+        <button class="btn btn-primary btn-sm" id="btnInit">Generate Bundle</button>
+        <button class="btn btn-outline-primary btn-sm" id="btnMetadata">Metadata</button>
+        <button class="btn btn-outline-primary btn-sm" id="btnAnnual">Annual Chart</button>
+        <button class="btn btn-outline-primary btn-sm" id="btnPeriod">Period Chart</button>
+        <button class="btn btn-outline-primary btn-sm" id="btnComparison">Comparison</button>
+        <button class="btn btn-outline-primary btn-sm" id="btnTable">Table</button>
+        <button class="btn btn-outline-secondary btn-sm" id="btnExportPreview">Export Preview</button>
+        <button class="btn btn-outline-danger btn-sm" id="btnClear">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="perf-box">
+    <div class="stats-grid" id="statsGrid">
+      <div class="stats-cell"><strong>Status</strong><div id="stat_status">Idle</div></div>
+      <div class="stats-cell"><strong>Total points</strong><div id="stat_points">0</div></div>
+      <div class="stats-cell"><strong>Bundle generation</strong><div id="stat_build_ms">-</div></div>
+      <div class="stats-cell"><strong>Chart render</strong><div id="stat_render_ms">-</div></div>
+      <div class="stats-cell"><strong>Table build</strong><div id="stat_table_ms">-</div></div>
+      <div class="stats-cell"><strong>Visible rows</strong><div id="stat_visible_rows">-</div></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col-12 col-lg-3">
+      <div class="card-lite mb-3">
+        <h5>Stages</h5>
+        <div id="report_stage_list"></div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-9">
+      <div class="card-lite">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h4 id="chart_title" class="mb-0">Output</h4>
+          <div class="small-muted" id="chart_subtitle">No bundle yet.</div>
+        </div>
+
+        <div class="row">
+          <div class="col-auto">
+            <div id="chart_series_toggles"></div>
+          </div>
+          <div class="col">
+            <div id="chart_labels" class="mb-2"></div>
+          </div>
+        </div>
+
+        <div id="chart">
+          <div class="placeholder-box">
+            Click <strong>Generate Bundle</strong> to build a full mock report payload in-browser.
+          </div>
+        </div>
+
+        <div id="control_bars" class="mt-2"></div>
+        <div id="rating_table" class="mt-3"></div>
+        <div id="metadata_body" class="mt-3"></div>
+        <div id="exportPreview" class="mt-3"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- JS CDN -->
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://code.jquery.com/ui/1.13.2/jquery-ui.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/es6-promise@4/dist/es6-promise.auto.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.30.1/moment.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.mask/1.14.16/jquery.mask.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-datepicker/1.9.0/js/bootstrap-datepicker.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/select/1.7.0/js/dataTables.select.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dygraph/2.2.1/dygraph.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bootbox.js/5.5.2/bootbox.min.js"></script>
+
+<script>
+  'use strict';
+
+  // =====================================================================================
+  // Minimal replacements for project-private utilities
+  // =====================================================================================
+  const LoadingModal = {
+    add_loading_modal() { $('#loadingMask').css('display', 'flex'); },
+    remove_loading_modal() { $('#loadingMask').hide(); }
+  };
+
+  function checkErr(res) {
+    console.error('Standalone error', res);
+  }
+
+  // =====================================================================================
+  // TableObj from your code
+  // =====================================================================================
+  let TableObj = {
+    create: (parentSelector, head, rows, className = "table table-striped table-hover table-bordered") => {
+      let selector = $(`<table><thead></thead><tbody></tbody></table>`);
+      if (className) {
+        selector = $(`<table class="${className}"><thead></thead><tbody></tbody></table>`);
+      }
+      $(parentSelector).append(selector);
+
+      let headSelector = selector.find('thead');
+      let bodySelector = selector.find('tbody');
+
+      let th = "";
+      head.forEach(h => {
+        th = th + `<th>${h}</th>`;
+      });
+      let headTr = `<tr>${th}</tr>`;
+      headSelector.append(headTr);
+
+      if (Array.isArray(rows) && rows.length) {
+        let td = "";
+        let tr = "";
+        rows.forEach(row => {
+          row.forEach((col) => {
+            td = td + `<td>${col}</td>`;
+          });
+          tr = tr + `<tr>${td}</tr>`;
+          td = "";
+        });
+        bodySelector.append(tr);
+      }
+      return selector;
+    },
+    addFeatures: (selector, parameter = {}) => {
+      return selector.DataTable(parameter);
+    }
+  };
+
+  // =====================================================================================
+  // Integrated subset from QCReportUtil snippet for standalone performance testing
+  // =====================================================================================
+  var QCReportUtil = (function () {
+    const TIME_OFFSET_TO_UTC = 43200000;
+
+    function QCReportUtil(data) {
+      this.report_data_bundle = data ? data : null;
+      this.report_metadata = data.report_metadata ? data.report_metadata : null;
+      this.audit_site = data.audit_site ? data.audit_site : null;
+      this.level_site = data.level_site ? data.level_site : null;
+      this.precip_site = data.precip_site ? data.precip_site : null;
+      this.flow_site = data.flow_site ? data.flow_site : null;
+      this.gwlevel_site = data.gwlevel_site ? data.gwlevel_site : null;
+      this.annotation_data = data.annotation_data ? data.annotation_data : null;
+      this.tool_version = data.version ? data.version : '1.0';
+      this.align_arr = null;
+      if (this.report_metadata) {
+        separate_period_data(
+                this.report_metadata.report_type,
+                this.report_metadata.period_from_date,
+                this.audit_site,
+                this.level_site,
+                this.precip_site,
+                this.flow_site,
+                this.gwlevel_site
+        );
+      }
+      this.data_checks = check_data(this.report_data_bundle, this.report_metadata.report_type);
+      this.graphs = [];
+      this.colours = {
+        cmd_o: '#00e700',
+        cmd_p: '#0000ff',
+        obs_epb: '#ff0a00',
+        obs_esg: '#000000',
+        obs_laser: '#ffa500',
+        precip: '#ff00ff',
+        comparison_o: '#08a4ff'
+      };
+    }
+
+    function check_data(data, report_type) {
+      function check(dataSet) {
+        if (dataSet) {
+          if (dataSet.length < 1) return null;
+          return true;
+        }
+        return false;
+      }
+      var output = {};
+      if (report_type === 'Level') {
+        if (data.audit_site) {
+          output.audit_site = {
+            level: {
+              cmd_o: check(data.audit_site.level.cmd_o.annual_data),
+              cmd_p: check(data.audit_site.level.cmd_p.annual_data),
+              obs_epb: check(data.audit_site.level.obs_epb.annual_data),
+              obs_esg: check(data.audit_site.level.obs_esg.annual_data),
+              obs_laser: check(data.audit_site.level.obs_laser.annual_data)
+            },
+            remarks: check(data.audit_site.remarks.annual_data)
+          };
+        }
+        if (data.level_site) {
+          output.level_site = {
+            level: { cmd_p: check(data.level_site.level.cmd_p.annual_data) }
+          };
+        }
+        if (data.precip_site) {
+          output.precip_site = {
+            precip: { cmd_p: check(data.precip_site.precip.cmd_p.annual_data) }
+          };
+        }
+      }
+      return output;
+    }
+
+    function period_data_chop(data, from_date) {
+      if (!data) return;
+      if (!data.annual_data) {
+        data.period_data = null;
+        return;
+      }
+      let target_date = from_date.substring(0, 4) + '-' + from_date.substring(5, 7) + '-' + from_date.substring(8, 10) + 'T00:00:00';
+      var period_data = [];
+      var annual_data = data.annual_data;
+      for (var i = annual_data.length - 1; i > -1; i--) {
+        if (annual_data[i][0].substring(0, 19) >= target_date) {
+          period_data.unshift(annual_data[i]);
+        } else {
+          break;
+        }
+      }
+      data.period_data = period_data;
+    }
+
+    function period_remark_chop(data, from_date) {
+      if (!data) return;
+      if (!data.annual_data) {
+        data.period_data = null;
+        return;
+      }
+      var target_date = from_date.substring(0, 4) + '-' + from_date.substring(5, 7) + '-' + from_date.substring(8, 10) + 'T00:00:00';
+      var selected_date;
+      var period_data = [];
+      var annual_data = data.annual_data;
+      for (var i = annual_data.length - 1; i > -1; i--) {
+        selected_date = annual_data[i].validFrom.substring(0, 19);
+        if (selected_date >= target_date) {
+          period_data.unshift(annual_data[i]);
+        }
+      }
+      data.period_data = period_data;
+    }
+
+    function separate_period_data(report_type, from_date, audit_site, level_site, precip_site) {
+      if (report_type === 'Level') {
+        if (audit_site) {
+          period_data_chop(audit_site.level.cmd_o, from_date);
+          period_data_chop(audit_site.level.cmd_p, from_date);
+          period_data_chop(audit_site.level.obs_epb, from_date);
+          period_data_chop(audit_site.level.obs_esg, from_date);
+          period_data_chop(audit_site.level.obs_laser, from_date);
+          period_remark_chop(audit_site.remarks, from_date);
+        }
+        if (level_site) {
+          period_data_chop(level_site.level.cmd_p, from_date);
+        }
+        if (precip_site) {
+          period_data_chop(precip_site.precip.cmd_p, from_date);
+        }
+      }
+    }
+
+    function empty_chart_elements(title_refresh = true) {
+      const selectors = [
+        '#chart_series_toggles',
+        '#chart_labels',
+        '#chart',
+        '#rating_table',
+        '#control_bars',
+        '#metadata_body',
+        '#exportPreview'
+      ];
+      if (title_refresh) selectors.push('#chart_title');
+      selectors.forEach(sel => $(sel).empty().show());
+    }
+
+    function get_plottable_ts(data) {
+      try {
+        if (!Array.isArray(data) || data.length === 0) return [];
+        const out = new Array(data.length);
+        for (let i = 0; i < data.length; i++) {
+          const row = data[i];
+          const value = (row[3] == 255 && row[1] == null) ? NaN : row[1];
+          out[i] = [new Date(row[0]), value];
+        }
+
+        return out;
+      } catch (e) {
+        $('#chart').append('<p>Failed to get plottable time series.</p>');
+        return [];
+      }
+    }
+
+    function prepare_dygraphs_data(input, ini_value_arr) {
+      try {
+        var date_arr = [];
+        var processed_input = input.map(ts => ts.map(p => [p[0], p[1]]));
+        processed_input.forEach(function (timeseries) {
+          timeseries.forEach(function (arr) {
+            arr[0] = arr[0].getTime() + TIME_OFFSET_TO_UTC;
+            date_arr.push(arr[0]);
+          });
+        });
+
+        var values_arr = ini_value_arr;
+        var output = date_arr.slice()
+                .sort(function (a, b) { return a - b; })
+                .reduce(function (arr, current_date) {
+                  if (arr.length === 0) {
+                    arr.push([current_date].concat(values_arr));
+                    return arr;
+                  }
+                  var previous_date = arr[arr.length - 1][0];
+                  if (previous_date !== current_date) {
+                    arr.push([current_date].concat(values_arr));
+                  }
+                  return arr;
+                }, []);
+
+        processed_input.forEach(function (timeseries, ts_index) {
+          ts_index = ts_index + 1;
+          var break_index = 0;
+          for (var i = 0; i < timeseries.length; i++) {
+            var input_time = timeseries[i][0];
+            for (break_index; break_index < output.length; break_index++) {
+              var output_time = output[break_index][0];
+              if (input_time === output_time) {
+                if (!isNaN(timeseries[i][1]) && timeseries[i][1] !== null) {
+                  output[break_index][ts_index] = Number(timeseries[i][1].toFixed(3));
+                } else {
+                  output[break_index][ts_index] = timeseries[i][1];
+                }
+                break;
+              }
+            }
+          }
+        });
+
+        output.forEach(function (arr) {
+          arr[0] = new Date(arr[0]);
+        });
+        return output;
+      } catch (e) {
+        $('#chart').append('<p>Failed to prepare data for Dygraph.</p>');
+        return null;
+      }
+    }
+
+    function get_min_max_value(data) {
+      let min = Infinity;
+      let max = -Infinity;
+
+      for (let i = 0; i < data.length; i++) {
+        const row = data[i];
+        for (let j = 1; j < row.length; j++) {
+          const v = row[j];
+          if (v != null && !isNaN(v)) {
+            if (v < min) min = v;
+            if (v > max) max = v;
+          }
+        }
+      }
+
+      return {
+        min: min === Infinity ? 'N/A' : min,
+        max: max === -Infinity ? 'N/A' : max
+      };
+    }
+
+    function format_site(site) {
+      if (!site) return 'None';
+      let sites = Array.isArray(site) ? site : [site];
+      let str = '';
+      sites.forEach((s, i) => {
+        str += s.site_id + '_' + s.station_id + ' ' + s.site_name + ' - ' + s.station_name + (i === sites.length - 1 ? '' : '<br>');
+      });
+      return str;
+    }
+
+    function metadata_item(string, value) {
+      if (value === true) return '<p>' + string + ': <span style="color:#009a00">data okay</span></p>';
+      if (value === false) return '<p>' + string + ': <span style="color:#ff0a00">data error</span></p>';
+      if (value === null) return '<p>' + string + ': <span style="color:#ff8900">data empty</span></p>';
+      return '';
+    }
+
+    function get_metadata_colour(d) {
+      var results = [];
+      function properties(obj) {
+        if (obj) {
+          for (var prop in obj) {
+            if (typeof obj[prop] !== 'object' || obj[prop] === null) {
+              results.push(obj[prop]);
+            } else {
+              properties(obj[prop]);
+            }
+          }
+        }
+      }
+      properties(d);
+      if (results.indexOf(false) >= 0) return '#ff0a00';
+      if (results.indexOf(null) >= 0) return '#ff8900';
+      return '#009a00';
+    }
+
+    function get_metadata_colour_obj(report_type, data_checks) {
+      var pass_colour = '#009a00';
+      var colour_obj = { audit_site: pass_colour, level_site: pass_colour, precip_site: pass_colour };
+      if (report_type === 'Level') {
+        colour_obj.audit_site = get_metadata_colour(data_checks.audit_site);
+        colour_obj.level_site = get_metadata_colour(data_checks.level_site);
+        colour_obj.precip_site = get_metadata_colour(data_checks.precip_site);
+      }
+      return colour_obj;
+    }
+
+    QCReportUtil.prototype.destroy_graphs = function () {
+      if (Array.isArray(this.graphs)) {
+        this.graphs.forEach(g => {
+          try { if (g && typeof g.destroy === 'function') g.destroy(); } catch (e) {}
+        });
+      }
+      this.graphs = [];
+    };
+
+    QCReportUtil.prototype.reset_main_screen = function () {
+      empty_chart_elements();
+      this.destroy_graphs();
+      var audit_site = this.audit_site;
+      if (!audit_site) {
+        $('#chart').append('<p>Audit site data not found.</p>');
+        return null;
+      }
+      return audit_site;
+    };
+
+    QCReportUtil.prototype.build_report_metadata = function () {
+      this.reset_main_screen();
+      $('#chart_title').text('Report Metadata');
+      const colours = get_metadata_colour_obj(this.report_metadata.report_type, this.data_checks);
+      $('#chart').html(
+              '<div class="stats-grid">' +
+              '<div class="stats-cell"><strong>Report Type</strong><div>' + this.report_metadata.report_type + '</div></div>' +
+              '<div class="stats-cell"><strong>Audit Site</strong><div style="color:' + colours.audit_site + '">' + format_site(this.audit_site) + '</div></div>' +
+              '<div class="stats-cell"><strong>Level Site</strong><div style="color:' + colours.level_site + '">' + format_site(this.level_site) + '</div></div>' +
+              '<div class="stats-cell"><strong>Precip Site</strong><div style="color:' + colours.precip_site + '">' + format_site(this.precip_site) + '</div></div>' +
+              '</div>'
+      );
+      let html = '';
+      html += metadata_item('Audit Cmd.O', this.data_checks.audit_site.level.cmd_o);
+      html += metadata_item('Audit Cmd.P', this.data_checks.audit_site.level.cmd_p);
+      html += metadata_item('Audit Obs.EPB', this.data_checks.audit_site.level.obs_epb);
+      html += metadata_item('Audit Obs.ESG', this.data_checks.audit_site.level.obs_esg);
+      html += metadata_item('Audit Obs.Laser', this.data_checks.audit_site.level.obs_laser);
+      html += metadata_item('Audit Remarks', this.data_checks.audit_site.remarks);
+      html += metadata_item('Level Site Cmd.P', this.data_checks.level_site.level.cmd_p);
+      html += metadata_item('Precip Site Cmd.P', this.data_checks.precip_site.precip.cmd_p);
+      $('#metadata_body').html('<div class="card-lite">' + html + '</div>');
+    };
+
+    QCReportUtil.prototype.render_level_chart = function (seriesDefs, title) {
+      this.reset_main_screen();
+      $('#chart_title').text(title);
+
+      const plottables = seriesDefs.map(s => get_plottable_ts(s.ts));
+      const labels = ['Time'].concat(seriesDefs.map(s => s.label));
+      const values_arr = new Array(seriesDefs.length).fill(NaN);
+
+      const t0 = performance.now();
+      const combined = prepare_dygraphs_data(plottables, values_arr);
+      const t1 = performance.now();
+
+      $('#chart').html('<div id="dygraph_host"></div>');
+      const g = new Dygraph(
+  document.getElementById('dygraph_host'),
+  combined,
+  {
+    labels: labels,
+    legend: 'always',
+    drawPoints: false,
+    strokeWidth: 1,
+    animatedZooms: false,
+    connectSeparatedPoints: false,
+    highlightCircleSize: 0,
+    axes: {
+      x: {
+        drawGrid: false
+      },
+      y: {
+        drawGrid: false,
+        valueFormatter: y =>
+          y == null || isNaN(y) ? 'null' : Number(y).toFixed(3)
+      }
+    },
+    series: seriesDefs.reduce((acc, s) => {
+      acc[s.label] = { color: s.color };
+      return acc;
+    }, {})
+  }
+);
+      this.graphs.push(g);
+
+      $('#chart_subtitle').text('Combined rows: ' + combined.length);
+      $('#chart_labels').html(
+              '<div class="alert alert-info py-2 mb-0">' +
+              'Data prep: <strong>' + (t1 - t0).toFixed(2) + ' ms</strong> | ' +
+              'Y min: <strong>' + minMax.min + '</strong> | ' +
+              'Y max: <strong>' + minMax.max + '</strong>' +
+              '</div>'
+      );
+
+      setStat('stat_render_ms', (t1 - t0).toFixed(2) + ' ms');
+      setStat('stat_visible_rows', combined.length);
+
+      return combined;
+    };
+
+    QCReportUtil.prototype.build_level_annual_chart = function () {
+      return this.render_level_chart([
+        { label: 'Cmd.O', ts: this.audit_site.level.cmd_o.annual_data, color: this.colours.cmd_o },
+        { label: 'Cmd.P', ts: this.audit_site.level.cmd_p.annual_data, color: this.colours.cmd_p },
+        { label: 'Obs.EPB', ts: this.audit_site.level.obs_epb.annual_data, color: this.colours.obs_epb }
+      ], 'Water Level - Annual');
+    };
+
+    QCReportUtil.prototype.build_level_period_chart = function () {
+      return this.render_level_chart([
+        { label: 'Cmd.O', ts: this.audit_site.level.cmd_o.period_data, color: this.colours.cmd_o },
+        { label: 'Cmd.P', ts: this.audit_site.level.cmd_p.period_data, color: this.colours.cmd_p },
+        { label: 'Obs.EPB', ts: this.audit_site.level.obs_epb.period_data, color: this.colours.obs_epb },
+        { label: 'Rain', ts: this.precip_site.precip.cmd_p.period_data, color: this.colours.precip }
+      ], 'Water Level - Period');
+    };
+
+    QCReportUtil.prototype.build_level_comparison_chart = function () {
+      return this.render_level_chart([
+        { label: 'Audit Cmd.P', ts: this.audit_site.level.cmd_p.annual_data, color: this.colours.cmd_p },
+        { label: 'Comparison Cmd.P', ts: this.level_site.level.cmd_p.annual_data, color: this.colours.comparison_o }
+      ], 'Water Level - Comparison');
+    };
+
+    QCReportUtil.prototype.build_table_preview = function () {
+      this.reset_main_screen();
+      $('#chart_title').text('Table Preview');
+      const rows = this.audit_site.level.cmd_p.annual_data.slice(0, 5000).map((r, idx) => [
+        idx + 1,
+        r[0].substring(0, 16).replace('T', ' '),
+        Number(r[1]).toFixed(3),
+        r[3]
+      ]);
+
+      const t0 = performance.now();
+      const table = TableObj.create('#rating_table', ['#', 'datetime', 'value', 'qualityCode'], rows);
+      TableObj.addFeatures(table, { pageLength: 25, order: [[0, 'asc']] });
+      const t1 = performance.now();
+
+      $('#chart').html('<div class="placeholder-box">Loaded first 5,000 rows into DataTable for DOM performance testing.</div>');
+      setStat('stat_table_ms', (t1 - t0).toFixed(2) + ' ms');
+      setStat('stat_visible_rows', rows.length);
+    };
+
+    QCReportUtil.prototype.build_export_preview = function () {
+      this.reset_main_screen();
+      $('#chart_title').text('Export Preview');
+      const simpleJSON = SyntheticDataFactory.exportSimpleJSON(this.audit_site.level.cmd_p).slice(0, 5);
+      const csvText = SyntheticDataFactory.exportCSV(this.audit_site.level.cmd_p).split('\n').slice(0, 6).join('\n');
+
+      $('#chart').html(
+              '<div class="row">' +
+              '<div class="col-12 col-lg-6">' +
+              '<h6>JSON preview</h6>' +
+              '<textarea class="code-view">' + escapeHtml(JSON.stringify(simpleJSON, null, 2)) + '</textarea>' +
+              '</div>' +
+              '<div class="col-12 col-lg-6">' +
+              '<h6>CSV preview</h6>' +
+              '<textarea class="code-view">' + escapeHtml(csvText) + '</textarea>' +
+              '</div>' +
+              '</div>'
+      );
+    };
+
+    return QCReportUtil;
+  })();
+
+  // =====================================================================================
+  // Stage list UI
+  // =====================================================================================
+  function build_stage_list_card(input) {
+    let card_string = `
+        <div class="card" id="button_${input.id}">
+          <div class="card-header" data-toggle="collapse" data-target="#${input.id}_card">
+            <h6 class="mb-0"><div class="btn">${input.title}</div></h6>
+          </div>
+          <div id="${input.id}_card" class="collapse" data-parent="#report_stage_list">
+      `;
+    if (input.checklist) {
+      card_string += '<div class="card-body">';
+      for (let i = 0; i < input.checklist.length; i++) {
+        card_string += `
+            <div class="row mb-2">
+              <div class="col-sm-1">
+                <input type="checkbox" class="check_item" id="${input.checklist[i].id}" ${input.checklist[i].checked ? 'checked' : ''}>
+              </div>
+              <div class="col">
+                <label class="check_label" for="${input.checklist[i].id}">${input.checklist[i].comment}</label>
+              </div>
+            </div>
+          `;
+      }
+      card_string += '</div>';
+    }
+    card_string += '</div></div>';
+    return card_string;
+  }
+
+  function level_report_stage_list(report_util) {
+    const is_checked = report_util.report_metadata.report_stage_list || {};
+    $('#report_stage_list').empty().append(
+            build_stage_list_card({ id: 'report_metadata', title: 'Report Metadata' }) +
+            build_stage_list_card({
+              id: 'water_level_annual',
+              title: 'Water Level - Annual',
+              checklist: [
+                { id: 'annual_consistent_qc_trace', comment: 'Data trace checked for consistency with previous nine months', checked: !!is_checked.annual_consistent_qc_trace }
+              ]
+            }) +
+            build_stage_list_card({
+              id: 'water_level_period',
+              title: 'Water Level - Period',
+              checklist: [
+                { id: 'period_observer_readings_okay', comment: 'Ensure at least one observer reading present', checked: !!is_checked.period_observer_readings_okay },
+                { id: 'period_observer_readings_correctness', comment: 'Check correctness of observer readings', checked: !!is_checked.period_observer_readings_correctness },
+                { id: 'period_p_vs_o', comment: 'P vs O time series checked for changes made to data', checked: !!is_checked.period_p_vs_o },
+                { id: 'period_qc_bar', comment: 'Quality code bar checked for appropriateness', checked: !!is_checked.period_qc_bar }
+              ]
+            }) +
+            build_stage_list_card({
+              id: 'water_level_comparison',
+              title: 'Water Level - Comparison',
+              checklist: [
+                { id: 'hydrograph_shape', comment: 'Hydrograph shape checked for consistency with comparison site', checked: !!is_checked.hydrograph_shape },
+                { id: 'hydrograph_magnitudes', comment: 'Hydrograph magnitudes checked for consistency with comparison site', checked: !!is_checked.hydrograph_magnitudes },
+                { id: 'hydrograph_regression', comment: 'Hydrograph regression shape looks correct', checked: !!is_checked.hydrograph_regression }
+              ]
+            }) +
+            build_stage_list_card({
+              id: 'water_level_table',
+              title: 'Table / DOM Test',
+              checklist: [
+                { id: 'adequate_comments', comment: 'Use first 5,000 rows to benchmark table creation', checked: !!is_checked.adequate_comments }
+              ]
+            }) +
+            build_stage_list_card({
+              id: 'export_preview',
+              title: 'Export Preview',
+              checklist: [
+                { id: 'obs_vs_logger_okay', comment: 'Preview JSON/CSV-like export output', checked: !!is_checked.obs_vs_logger_okay }
+              ]
+            })
+    );
+  }
+
+  function bindStageEvents() {
+    $('#report_stage_list').off('shown.bs.collapse');
+    $('#report_stage_list').on('shown.bs.collapse', function (el) {
+      const $this = $('#' + el.target.id).parent();
+      $this.siblings().removeClass('active bg-secondary');
+      $this.addClass('active bg-secondary');
+      if (!window.report_util) return;
+      switch ($this.attr('id')) {
+        case 'button_report_metadata':
+          report_util.build_report_metadata();
+          break;
+        case 'button_water_level_annual':
+          report_util.build_level_annual_chart();
+          break;
+        case 'button_water_level_period':
+          report_util.build_level_period_chart();
+          break;
+        case 'button_water_level_comparison':
+          report_util.build_level_comparison_chart();
+          break;
+        case 'button_water_level_table':
+          report_util.build_table_preview();
+          break;
+        case 'button_export_preview':
+          report_util.build_export_preview();
+          break;
+      }
+    });
+  }
+
+  // =====================================================================================
+  // App state / helpers
+  // =====================================================================================
+  window.report_bundle = null;
+  window.report_util = null;
+
+  function setStat(id, value) {
+    $('#' + id).text(value);
+  }
+
+  function setStatus(text) {
+    setStat('stat_status', text);
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;');
+  }
+
+  function clearOutputs() {
+    $('#chart_title').text('Output');
+    $('#chart_subtitle').text('Ready.');
+    $('#chart_series_toggles, #chart_labels, #control_bars, #rating_table, #metadata_body, #exportPreview').empty();
+    $('#chart').html('<div class="placeholder-box">Cleared.</div>');
+  }
+
+  function generateBundle() {
+    LoadingModal.add_loading_modal();
+    const t0 = performance.now();
+    window.report_bundle = SyntheticDataFactory.makeLevelBundle();
+    window.report_util = new QCReportUtil(window.report_bundle);
+    const t1 = performance.now();
+
+    level_report_stage_list(window.report_util);
+    bindStageEvents();
+
+    const totalPoints = window.report_bundle.audit_site.level.cmd_p.annual_data.length;
+    setStat('stat_points', totalPoints.toLocaleString());
+    setStat('stat_build_ms', (t1 - t0).toFixed(2) + ' ms');
+    setStatus('Bundle ready');
+    $('#chart_subtitle').text('Synthetic bundle generated in browser.');
+    LoadingModal.remove_loading_modal();
+    report_util.build_report_metadata();
+  }
+
+  // =====================================================================================
+  // Events
+  // =====================================================================================
+  $(function () {
+    $('#btnInit').on('click', generateBundle);
+    $('#btnMetadata').on('click', function () { if (report_util) report_util.build_report_metadata(); });
+    $('#btnAnnual').on('click', function () { if (report_util) report_util.build_level_annual_chart(); });
+    $('#btnPeriod').on('click', function () { if (report_util) report_util.build_level_period_chart(); });
+    $('#btnComparison').on('click', function () { if (report_util) report_util.build_level_comparison_chart(); });
+    $('#btnTable').on('click', function () { if (report_util) report_util.build_table_preview(); });
+    $('#btnExportPreview').on('click', function () { if (report_util) report_util.build_export_preview(); });
+    $('#btnClear').on('click', function () {
+      if (window.report_util && typeof window.report_util.destroy_graphs === 'function') {
+        window.report_util.destroy_graphs();
+      }
+      clearOutputs();
+      setStatus('Cleared');
+    });
+
+    // auto-generate once for immediate standalone use
+    generateBundle();
+  });
+</script>
+</body>
+</html>
