@@ -1,0 +1,545 @@
+分工：
+CPU 负责控制，
+Accelerator 负责DMA and 计算，
+Main Memory 负责存储。
+
+C 程序
+初始化 matrix
+配置 accelerator
+启动 accelerator
+测速和验证
+
+Accelerator
+读 memory
+执行 convolution
+处理 zero padding
+写回 output
+
+
+
+
+
+
+ 
+Process:
+1. CPU 初始化矩阵
+2. CPU 配置 accelerator
+3. CPU 发送 START
+4. Accelerator 读取 input/kernel
+5. Accelerator 执行 convolution
+6. Accelerator 写回 output
+7. Accelerator 设置 DONE
+8. CPU 读取结果
+9. CPU 验证正确性
+10. CPU 统计性能
+
+
+#include <stdint.h>
+#include <stdio.h>
+#include "rocc.h"
+
+#define N 32
+#define MAX_K 5
+#define FXP_SHIFT 8
+
+#define CUSTOM_0 0
+
+#define SET_INPUT    0x01
+#define SET_KERNEL   0x02
+#define SET_OUTPUT   0x03
+#define SET_KSIZE    0x04
+#define START        0x05
+#define READ_STATUS  0x06
+#define READ_ERROR   0x07
+
+#define STATUS_BUSY  0x1
+#define STATUS_DONE  0x2
+#define STATUS_ERROR 0x4
+
+static int16_t input[N][N];
+static int16_t kernel[MAX_K][MAX_K];
+static int16_t output_accel[N][N];
+static int16_t output_cpu[N][N];
+
+static inline uint64_t read_cycle(void) {
+    uint64_t cycles;
+    asm volatile ("rdcycle %0" : "=r"(cycles));
+    return cycles;
+}
+
+void init_data(void) {
+    for (int y = 0; y < N; y++) {
+        for (int x = 0; x < N; x++) {
+            input[y][x] = (int16_t)((y + x) << FXP_SHIFT);  // Q8.8
+            output_accel[y][x] = 0;
+            output_cpu[y][x] = 0;
+        }
+    }
+
+    for (int y = 0; y < MAX_K; y++) {
+        for (int x = 0; x < MAX_K; x++) {
+            kernel[y][x] = 0;
+        }
+    }
+
+    // Example 3x3 blur-like kernel in Q8.8
+    kernel[0][0] = 1 << FXP_SHIFT;
+    kernel[0][1] = 1 << FXP_SHIFT;
+    kernel[0][2] = 1 << FXP_SHIFT;
+
+    kernel[1][0] = 1 << FXP_SHIFT;
+    kernel[1][1] = 1 << FXP_SHIFT;
+    kernel[1][2] = 1 << FXP_SHIFT;
+
+    kernel[2][0] = 1 << FXP_SHIFT;
+    kernel[2][1] = 1 << FXP_SHIFT;
+    kernel[2][2] = 1 << FXP_SHIFT;
+}
+
+void conv_cpu(int16_t in[N][N],
+              int16_t ker[MAX_K][MAX_K],
+              int16_t out[N][N],
+              int ksize) {
+    int pad = ksize / 2;
+
+    for (int y = 0; y < N; y++) {
+        for (int x = 0; x < N; x++) {
+            int32_t sum = 0;
+
+            for (int ky = 0; ky < ksize; ky++) {
+                for (int kx = 0; kx < ksize; kx++) {
+                    int iy = y + ky - pad;
+                    int ix = x + kx - pad;
+
+                    // CPU golden model also handles zero padding
+                    if (iy >= 0 && iy < N && ix >= 0 && ix < N) {
+                        sum += (int32_t)in[iy][ix] * (int32_t)ker[ky][kx];
+                    }
+                }
+            }
+
+            out[y][x] = (int16_t)(sum >> FXP_SHIFT);
+        }
+    }
+}
+
+void conv_accel(int16_t *in,
+                int16_t *ker,
+                int16_t *out,
+                int ksize) {
+    uint64_t status = 0;
+    uint64_t err = 0;
+
+    ROCC_INSTRUCTION_SS(CUSTOM_0, (uint64_t)in, 0, SET_INPUT);
+    ROCC_INSTRUCTION_SS(CUSTOM_0, (uint64_t)ker, 0, SET_KERNEL);
+    ROCC_INSTRUCTION_SS(CUSTOM_0, (uint64_t)out, 0, SET_OUTPUT);
+    ROCC_INSTRUCTION_SS(CUSTOM_0, (uint64_t)ksize, 0, SET_KSIZE);
+
+    ROCC_INSTRUCTION(CUSTOM_0, START);
+
+    do {
+        ROCC_INSTRUCTION_D(CUSTOM_0, status, READ_STATUS);
+    } while ((status & STATUS_DONE) == 0 && (status & STATUS_ERROR) == 0);
+
+    if (status & STATUS_ERROR) {
+        ROCC_INSTRUCTION_D(CUSTOM_0, err, READ_ERROR);
+        printf("Accelerator error code: %lu\n", err);
+    }
+}
+
+int check_result(void) {
+    for (int y = 0; y < N; y++) {
+        for (int x = 0; x < N; x++) {
+            if (output_cpu[y][x] != output_accel[y][x]) {
+                printf("Mismatch at [%d][%d]: CPU=%d ACCEL=%d\n",
+                       y, x, output_cpu[y][x], output_accel[y][x]);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+int main(void) {
+    int ksize = 3;
+
+    init_data();
+
+    uint64_t cpu_start = read_cycle();
+    conv_cpu(input, kernel, output_cpu, ksize);
+    uint64_t cpu_end = read_cycle();
+
+    uint64_t accel_start = read_cycle();
+    conv_accel(&input[0][0], &kernel[0][0], &output_accel[0][0], ksize);
+    uint64_t accel_end = read_cycle();
+
+    uint64_t cpu_cycles = cpu_end - cpu_start;
+    uint64_t accel_cycles = accel_end - accel_start;
+
+    printf("CPU cycles:   %lu\n", cpu_cycles);
+    printf("Accel cycles: %lu\n", accel_cycles);
+
+    if (check_result()) {
+        printf("Result correct.\n");
+    } else {
+        printf("Result incorrect.\n");
+    }
+
+    return 0;
+}
+
+Chisel FSM:
+
+IDLE
+CHECK_CONFIG
+LOAD_KERNEL
+COMPUTE
+READ_INPUT
+MAC
+WRITE_OUTPUT
+DONE
+ERROR
+state transition table
+Current State	Condition	Next State	Action
+IDLE	start = 0	IDLE	Wait
+IDLE	start = 1	CHECK_CONFIG	Clear done, error; set busy
+CHECK_CONFIG	invalid ksize	ERROR	Set error code
+CHECK_CONFIG	config valid	LOAD_KERNEL	Start loading kernel
+LOAD_KERNEL	kernel not fully loaded	LOAD_KERNEL	Read kernel from memory
+LOAD_KERNEL	kernel loaded	COMPUTE_INIT	Set x=0, y=0
+COMPUTE_INIT	always	READ_INPUT	Set kx=0, ky=0, sum=0
+READ_INPUT	input coordinate outside matrix	MAC	Use inputVal = 0
+READ_INPUT	input coordinate valid	WAIT_INPUT	Send memory read request
+WAIT_INPUT	memory response not ready	WAIT_INPUT	Wait
+WAIT_INPUT	memory response ready	MAC	Store returned input value
+MAC	kernel window not finished	READ_INPUT	Accumulate and increment kx/ky
+MAC	kernel window finished	WRITE_OUTPUT	Prepare result
+WRITE_OUTPUT	memory not ready	WRITE_OUTPUT	Wait to write output
+WRITE_OUTPUT	output written, not last pixel	COMPUTE_INIT	Move to next x/y
+WRITE_OUTPUT	output written, last pixel	DONE	Finish convolution
+DONE	status read / reset	IDLE	Clear busy, keep done
+ERROR	status read / reset	IDLE	Clear busy, keep error
+
+Add memory access as separate FSM states:
+LOAD_KERNEL_REQ
+LOAD_KERNEL_RESP
+READ_INPUT_REQ
+READ_INPUT_RESP
+WRITE_OUTPUT_REQ
+
+class ConvAccelModule extends Module {
+  val io = IO(new Bundle {
+    val start = Input(Bool())
+    val inputBase = Input(UInt(64.W))
+    val kernelBase = Input(UInt(64.W))
+    val outputBase = Input(UInt(64.W))
+    val kSize = Input(UInt(3.W))
+
+    val busy = Output(Bool())
+    val done = Output(Bool())
+    val error = Output(Bool())
+  })
+
+  val sIdle :: sCheck :: sLoadKernel :: sCompute ::
+    sReadInput :: sMac :: sWriteOutput :: sDone :: sError :: Nil = Enum(9)
+
+  val state = RegInit(sIdle)
+
+  val x  = RegInit(0.U(6.W))
+  val y  = RegInit(0.U(6.W))
+  val kx = RegInit(0.U(3.W))
+  val ky = RegInit(0.U(3.W))
+
+  val sum = RegInit(0.S(40.W))
+
+  val kernelBuf = Reg(Vec(25, SInt(16.W)))
+
+  io.busy := state =/= sIdle && state =/= sDone && state =/= sError
+  io.done := state === sDone
+  io.error := state === sError
+
+  switch(state) {
+    is(sIdle) {
+      when(io.start) {
+        state := sCheck
+      }
+    }
+
+    is(sCheck) {
+      when(io.kSize === 0.U || io.kSize > 5.U || io.kSize(0) === 0.U) {
+        state := sError
+      }.otherwise {
+        state := sLoadKernel
+      }
+    }
+
+    is(sLoadKernel) {
+      // Later: load kernel from memory into kernelBuf
+      state := sCompute
+    }
+
+    is(sCompute) {
+      x := 0.U
+      y := 0.U
+      kx := 0.U
+      ky := 0.U
+      sum := 0.S
+      state := sReadInput
+    }
+
+    is(sReadInput) {
+      // Later: calculate input address
+      // If outside boundary, inputVal = 0
+      // Otherwise read input from memory
+      state := sMac
+    }
+
+    is(sMac) {
+      // Later:
+      // sum := sum + inputVal * kernelBuf(ky * 5 + kx)
+
+      when(kx === io.kSize - 1.U) {
+        kx := 0.U
+        when(ky === io.kSize - 1.U) {
+          ky := 0.U
+          state := sWriteOutput
+        }.otherwise {
+          ky := ky + 1.U
+          state := sReadInput
+        }
+      }.otherwise {
+        kx := kx + 1.U
+        state := sReadInput
+      }
+    }
+
+    is(sWriteOutput) {
+      // Later: write result to output memory
+
+      sum := 0.S
+
+      when(x === 31.U) {
+        x := 0.U
+        when(y === 31.U) {
+          state := sDone
+        }.otherwise {
+          y := y + 1.U
+          state := sReadInput
+        }
+      }.otherwise {
+        x := x + 1.U
+        state := sReadInput
+      }
+    }
+
+    is(sDone) {
+      when(!io.start) {
+        state := sIdle
+      }
+    }
+
+    is(sError) {
+      when(!io.start) {
+        state := sIdle
+      }
+    }
+  }
+}
+
+
+
+// Memory command constants
+val READ  = M_XRD
+val WRITE = M_XWR
+
+val sIdle :: sCheck ::
+  sLoadKernelReq :: sLoadKernelResp ::
+  sComputeInit ::
+  sReadInputReq :: sReadInputResp ::
+  sMac ::
+  sWriteOutputReq ::
+  sDone :: sError :: Nil = Enum(10)
+
+val state = RegInit(sIdle)
+
+val x  = RegInit(0.U(6.W))
+val y  = RegInit(0.U(6.W))
+val kx = RegInit(0.U(3.W))
+val ky = RegInit(0.U(3.W))
+
+val kernelIndex = RegInit(0.U(5.W))
+val inputVal = RegInit(0.S(16.W))
+val sum = RegInit(0.S(40.W))
+
+val kernelBuf = Reg(Vec(25, SInt(16.W)))
+
+// Default memory signals
+io.mem.req.valid := false.B
+io.mem.req.bits.addr := 0.U
+io.mem.req.bits.cmd := M_XRD
+io.mem.req.bits.data := 0.U
+io.mem.req.bits.size := 1.U   // 2 bytes for int16_t
+
+switch(state) {
+
+  is(sIdle) {
+    when(start) {
+      state := sCheck
+    }
+  }
+
+  is(sCheck) {
+    when(kSize === 3.U || kSize === 5.U) {
+      kernelIndex := 0.U
+      state := sLoadKernelReq
+    }.otherwise {
+      state := sError
+    }
+  }
+
+  // -------------------------
+  // Load kernel from memory
+  // -------------------------
+  is(sLoadKernelReq) {
+    val addr = kernelBase + (kernelIndex << 1) // int16_t = 2 bytes
+
+    io.mem.req.valid := true.B
+    io.mem.req.bits.addr := addr
+    io.mem.req.bits.cmd := M_XRD
+    io.mem.req.bits.size := 1.U
+
+    when(io.mem.req.ready) {
+      state := sLoadKernelResp
+    }
+  }
+
+  is(sLoadKernelResp) {
+    when(io.mem.resp.valid) {
+      kernelBuf(kernelIndex) := io.mem.resp.bits.data(15, 0).asSInt
+
+      when(kernelIndex === (kSize * kSize - 1.U)) {
+        state := sComputeInit
+      }.otherwise {
+        kernelIndex := kernelIndex + 1.U
+        state := sLoadKernelReq
+      }
+    }
+  }
+
+  // -------------------------
+  // Start one output pixel
+  // -------------------------
+  is(sComputeInit) {
+    kx := 0.U
+    ky := 0.U
+    sum := 0.S
+    state := sReadInputReq
+  }
+
+  // -------------------------
+  // Read input value
+  // -------------------------
+  is(sReadInputReq) {
+    val pad = kSize >> 1
+
+    val ix = x.asSInt + kx.asSInt - pad.asSInt
+    val iy = y.asSInt + ky.asSInt - pad.asSInt
+
+    val outside =
+      ix < 0.S || ix >= 32.S ||
+      iy < 0.S || iy >= 32.S
+
+    when(outside) {
+      inputVal := 0.S
+      state := sMac
+    }.otherwise {
+      val inputIndex = (iy.asUInt * 32.U) + ix.asUInt
+      val addr = inputBase + (inputIndex << 1)
+
+      io.mem.req.valid := true.B
+      io.mem.req.bits.addr := addr
+      io.mem.req.bits.cmd := M_XRD
+      io.mem.req.bits.size := 1.U
+
+      when(io.mem.req.ready) {
+        state := sReadInputResp
+      }
+    }
+  }
+
+  is(sReadInputResp) {
+    when(io.mem.resp.valid) {
+      inputVal := io.mem.resp.bits.data(15, 0).asSInt
+      state := sMac
+    }
+  }
+
+  // -------------------------
+  // MAC calculation
+  // -------------------------
+  is(sMac) {
+    val kIndex = ky * kSize + kx
+    val product = inputVal * kernelBuf(kIndex)
+
+    sum := sum + product.asSInt
+
+    when(kx === kSize - 1.U) {
+      kx := 0.U
+      when(ky === kSize - 1.U) {
+        ky := 0.U
+        state := sWriteOutputReq
+      }.otherwise {
+        ky := ky + 1.U
+        state := sReadInputReq
+      }
+    }.otherwise {
+      kx := kx + 1.U
+      state := sReadInputReq
+    }
+  }
+
+  // -------------------------
+  // Write output back to memory
+  // -------------------------
+  is(sWriteOutputReq) {
+    val outputIndex = y * 32.U + x
+    val addr = outputBase + (outputIndex << 1)
+
+    val result = (sum >> 8).asSInt
+
+    io.mem.req.valid := true.B
+    io.mem.req.bits.addr := addr
+    io.mem.req.bits.cmd := M_XWR
+    io.mem.req.bits.size := 1.U
+    io.mem.req.bits.data := result.asUInt
+
+    when(io.mem.req.ready) {
+      when(x === 31.U) {
+        x := 0.U
+        when(y === 31.U) {
+          state := sDone
+        }.otherwise {
+          y := y + 1.U
+          state := sComputeInit
+        }
+      }.otherwise {
+        x := x + 1.U
+        state := sComputeInit
+      }
+    }
+  }
+
+  is(sDone) {
+    done := true.B
+    busy := false.B
+  }
+
+  is(sError) {
+    error := true.B
+    busy := false.B
+  }
+}
+
+
+
+
